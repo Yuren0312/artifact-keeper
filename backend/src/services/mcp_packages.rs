@@ -1138,30 +1138,36 @@ async fn gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<GateRow>, sqlx::
             })
             .collect());
     }
-    let rows: Vec<GateRowTuple> = if pin.registry_type == "oci" {
+    if pin.registry_type == "oci" {
+        // #5457: every alias of the pinned digest, the rows the native
+        // manifest gate evaluates too.
         let r = &pin.resolved;
-        let hexes: Vec<String> = [r.digest.as_deref(), r.gate_digest.as_deref()]
+        let digests: Vec<&str> = [r.digest.as_deref(), r.gate_digest.as_deref()]
             .into_iter()
             .flatten()
-            .map(|d| hex_of(d).to_string())
             .collect();
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT {GATE_ROW_COLUMNS} FROM artifacts WHERE repository_id = $1 \
-             AND is_deleted = false AND checksum_sha256 = ANY($2) \
-             AND path LIKE 'v2/%/manifests/%'"
-        )))
-        .bind(r.repository_id)
-        .bind(&hexes)
-        .fetch_all(db)
-        .await?
-    } else {
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT {GATE_ROW_COLUMNS} FROM artifacts WHERE id = ANY($1) AND is_deleted = false"
-        )))
-        .bind(&pin.resolved.artifact_ids)
-        .fetch_all(db)
-        .await?
-    };
+        let rows =
+            crate::services::oci_manifests::alias_rows(db, r.repository_id, &digests).await?;
+        return Ok(rows
+            .into_iter()
+            .map(|a| {
+                gate_row((
+                    a.id,
+                    a.repository_id,
+                    a.checksum,
+                    a.created_at,
+                    a.quarantine_status,
+                    a.quarantine_until,
+                ))
+            })
+            .collect());
+    }
+    let rows: Vec<GateRowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {GATE_ROW_COLUMNS} FROM artifacts WHERE id = ANY($1) AND is_deleted = false"
+    )))
+    .bind(&pin.resolved.artifact_ids)
+    .fetch_all(db)
+    .await?;
     Ok(rows.into_iter().map(gate_row).collect())
 }
 
@@ -1513,18 +1519,20 @@ async fn backing_gate(ctx: GateCtx<'_>, cache: &mut FactsCache, pin: &PackagePin
         return GateOutcome::Unresolvable;
     }
     let now = Utc::now();
-    for row in &rows {
-        if row.cached {
-            if row.cache_held(now) {
-                return GateOutcome::Quarantine;
-            }
-            continue;
-        }
-        if let Err(e) =
-            crate::services::quarantine_service::enforce_download_gate(ctx.db, row.id).await
-        {
-            return outcome_for_gate_error(&e);
-        }
+    if rows.iter().any(|row| row.cache_held(now)) {
+        return GateOutcome::Quarantine;
+    }
+    if let Err((_, e)) = crate::services::quarantine_service::enforce_download_gate_all(
+        ctx.db,
+        &rows
+            .iter()
+            .filter(|row| !row.cached)
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+    )
+    .await
+    {
+        return outcome_for_gate_error(&e);
     }
     match remote_gates(ctx, cache, pin, &rows).await {
         Ok(Some(outcome)) => outcome,
