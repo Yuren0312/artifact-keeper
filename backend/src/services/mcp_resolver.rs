@@ -280,7 +280,19 @@ async fn find_cached(
     let Some(version) = pkg.version.as_deref() else {
         return Ok(None);
     };
-    let Some(key) = cache_key(&pkg.registry_type, &pkg.identifier, version) else {
+    cached_entry(db, remote.id, &pkg.registry_type, &pkg.identifier, version).await
+}
+
+/// The proxy-cache entry of `registry_type` `identifier@version` in the
+/// Remote `remote_id`, as `(path, sha256)`: [`find_cached`] by its parts.
+pub(crate) async fn cached_entry(
+    db: &PgPool,
+    remote_id: Uuid,
+    registry_type: &str,
+    identifier: &str,
+    version: &str,
+) -> Result<Option<(String, String)>, McpError> {
+    let Some(key) = cache_key(registry_type, identifier, version) else {
         return Ok(None);
     };
     // Proxy-cache paths are exact, case-sensitive storage keys (the format
@@ -310,7 +322,7 @@ async fn find_cached(
            AND (path LIKE $2 ESCAPE '\\' OR path = $3) \
          ORDER BY path LIMIT 200",
     )
-    .bind(remote.id)
+    .bind(remote_id)
     .bind(&pattern)
     .bind(exact)
     .fetch_all(db)
@@ -320,7 +332,7 @@ async fn find_cached(
         CacheKey::PypiFiles { .. } => path
             .rsplit('/')
             .next()
-            .is_some_and(|f| pypi_file_matches(f, &pkg.identifier, version)),
+            .is_some_and(|f| pypi_file_matches(f, identifier, version)),
         _ => true,
     }))
 }

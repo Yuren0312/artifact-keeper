@@ -491,6 +491,14 @@ the pinned bytes are the bytes that route serves:
 
 A Virtual backing repository pins the first member, by priority, that holds
 the version: the member a download through the Virtual is served from.
+The pin stays bound to that member's rows. If a member that outranks it
+later holds the same version (published, pulled through, or in its proxy
+cache, whatever its quarantine state), or the pinned member leaves the
+Virtual, a client following the approved document would download (or be
+refused) bytes the gate never evaluated, so the version is held as
+`mcp_unresolvable` instead (#5456). The pin is never moved silently: the
+version serves again once the shadowing version is gone, or publish a new
+server version to pin what the Virtual serves now.
 A proxy-cache entry ([Packages in a Remote backing
 repository](#packages-in-a-remote-backing-repository)) matches by its exact,
 case-sensitive cache path (`1.0.0-RC.1` is not `1.0.0-rc.1`); a NuGet entry by
@@ -578,7 +586,7 @@ One decision function (`decide_mcp_serve`) answers every read:
 | pinned package quarantined | omitted | skipped | `404` plain | `404` + `package`, `gate: quarantine` | `mcp_backing_artifact_blocked` |
 | pinned package refused by scan policy or rejected, or by its Remote's stored proxy-scan verdict | omitted | skipped | `404` plain | `404` + `package`, `gate: scan_policy` | `mcp_backing_artifact_blocked` |
 | pinned package younger than its Remote's age gate | omitted | skipped | `404` plain | `404` + `package`, `gate: age_gate`, `review_id`, `min_age_days`, `requested_age_days` | `mcp_age_gate_blocked` |
-| pinned package gone, or the policy changed | omitted | skipped | `404` plain | `404` + `package` | `mcp_unresolvable` |
+| pinned package gone, shadowed by a higher-priority Virtual member, or the policy changed | omitted | skipped | `404` plain | `404` + `package` | `mcp_unresolvable` |
 | a gate cannot be evaluated (database error) | omitted | `503` | `503` | `503` | `mcp_gate_unavailable` |
 | `deprecated` | listed | eligible | `200` | `200` | |
 | `deleted` | omitted unless `include_deleted=true` | skipped | `404` plain; `200` with `include_deleted=true` | same | |

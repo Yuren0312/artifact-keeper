@@ -6728,4 +6728,329 @@ mod tests {
         assert_eq!(count(), before, "a held read decides its candidate instead");
         env.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // #5456: late shadowing in a Virtual backing repository
+    // -----------------------------------------------------------------------
+
+    /// One backing format: how a package is stored, published and downloaded
+    /// natively through a Virtual.
+    struct ShadowCase {
+        registry_type: &'static str,
+        /// The `identifier` the server.json names.
+        identifier: &'static str,
+        /// The artifact `name` the format's publish path stores.
+        name: &'static str,
+        path: &'static str,
+        /// The native download route, after `/{virtual}`.
+        download: &'static str,
+        router: fn() -> Router<SharedState>,
+    }
+
+    const SHADOW_CASES: [ShadowCase; 4] = [
+        ShadowCase {
+            registry_type: "npm",
+            identifier: "@acme/echo",
+            name: "@acme/echo",
+            path: "@acme/echo/-/echo-1.0.0.tgz",
+            download: "/@acme/echo/-/echo-1.0.0.tgz",
+            router: crate::api::handlers::npm::router,
+        },
+        ShadowCase {
+            registry_type: "pypi",
+            identifier: "Acme_Echo",
+            name: "acme-echo",
+            path: "acme-echo/1.0.0/acme_echo-1.0.0.tar.gz",
+            download: "/simple/acme-echo/acme_echo-1.0.0.tar.gz",
+            router: crate::api::handlers::pypi::router,
+        },
+        ShadowCase {
+            registry_type: "nuget",
+            identifier: "Acme.Echo",
+            name: "Acme.Echo",
+            path: "Acme.Echo/1.0.0/Acme.Echo.1.0.0.nupkg",
+            download: "/v3/flatcontainer/acme.echo/1.0.0/acme.echo.1.0.0.nupkg",
+            router: crate::api::handlers::nuget::router,
+        },
+        ShadowCase {
+            registry_type: "cargo",
+            identifier: "acme-echo",
+            name: "acme-echo",
+            path: "crates/acme-echo/1.0.0.crate",
+            download: "/api/v1/crates/acme-echo/1.0.0/download",
+            router: crate::api::handlers::cargo::router,
+        },
+    ];
+
+    /// Virtual `V` = [`H` (priority 1, empty), `L` (priority 2, bytes A)],
+    /// mapped for the case's registry type, with server `com.acme/shadow`
+    /// published and pinned to A.
+    struct Shadowed {
+        virt: RepoInfo,
+        high: RepoInfo,
+        low_id: Uuid,
+        a: Uuid,
+        a_sha: String,
+    }
+
+    const SHADOW_TAIL: &str = "/servers/com.acme%2Fshadow/versions/1.0.0";
+
+    impl Env {
+        async fn seed_package(&self, case: &ShadowCase, repo: &RepoInfo, bytes: &[u8]) -> Uuid {
+            tdh::seed_artifact_with_checksum(
+                &self.fx.state,
+                &self.fx.pool,
+                repo,
+                &format!("shadow/{}/{}", Uuid::new_v4(), case.registry_type),
+                case.path,
+                case.name,
+                "1.0.0",
+                "application/octet-stream",
+                Bytes::copy_from_slice(bytes),
+                self.fx.user_id,
+                &fmt::sha256_hex(bytes),
+            )
+            .await
+        }
+
+        async fn shadow_fixture(&mut self, case: &ShadowCase) -> Shadowed {
+            self.shadow_fixture_over(case, "local").await
+        }
+
+        /// [`Self::shadow_fixture`] with `H` of `high_type`.
+        async fn shadow_fixture_over(&mut self, case: &ShadowCase, high_type: &str) -> Shadowed {
+            let ty = case.registry_type;
+            let virt = self.repo("virtual", ty).await;
+            let high = self.repo(high_type, ty).await;
+            let low = self.repo("local", ty).await;
+            tdh::link_virtual_member(&self.fx.pool, virt.id, high.id, 1).await;
+            tdh::link_virtual_member(&self.fx.pool, virt.id, low.id, 2).await;
+            let a = self.seed_package(case, &low, b"approved bytes A").await;
+            self.config(
+                mcp_packages::REPOS_KEY,
+                &serde_json::json!({ ty: virt.key }).to_string(),
+            )
+            .await;
+            let d = doc(
+                "com.acme/shadow",
+                "1.0.0",
+                serde_json::json!({"packages": [{"registryType": ty,
+                    "identifier": case.identifier, "version": "1.0.0",
+                    "transport": {"type": "stdio"}}]}),
+            );
+            let (s, b) = self.publish(&d).await;
+            assert_eq!(s, StatusCode::OK, "{ty}: {b}");
+            assert_eq!(
+                b["server"]["packages"][0]["registryBaseUrl"],
+                mcp_packages::backing_base_url("http://localhost", ty, &virt.key),
+                "{ty}: the advertised URL is the Virtual"
+            );
+            Shadowed {
+                virt,
+                high,
+                low_id: low.id,
+                a,
+                a_sha: fmt::sha256_hex(b"approved bytes A"),
+            }
+        }
+
+        /// The stored pin: `(resolved.sha256, resolved.artifactIds)`.
+        async fn stored_pin(&self) -> (String, Vec<Uuid>) {
+            let id = self.server_artifact("com.acme/shadow", "1.0.0").await;
+            let meta: serde_json::Value = sqlx::query_scalar(
+                "SELECT metadata#>'{packages,0,resolved}' FROM artifact_metadata \
+                 WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&self.fx.pool)
+            .await
+            .unwrap();
+            let ids = meta["artifactIds"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()?.parse().ok()).collect())
+                .unwrap_or_default();
+            (meta["sha256"].as_str().unwrap_or_default().to_string(), ids)
+        }
+
+        /// A native download through the Virtual: its status and, when
+        /// served, the sha256 of the delivered bytes.
+        async fn native(&self, case: &ShadowCase, virt: &RepoInfo) -> (StatusCode, Option<String>) {
+            let uri = format!("/{}{}", virt.key, case.download);
+            let (s, body, _) = call(self.member_router((case.router)()), "GET", &uri, None).await;
+            (s, (s == StatusCode::OK).then(|| fmt::sha256_hex(&body)))
+        }
+
+        /// The exact read as an anonymous reader and as the repository
+        /// holder (`error` of the holder's refusal), and the listing count.
+        async fn mcp_view(&self) -> (StatusCode, Option<String>, i64) {
+            let (anon, body, _) = self.get(self.anon(), SHADOW_TAIL).await;
+            if anon != StatusCode::OK {
+                assert_eq!(body.as_ref(), fmt::NOT_FOUND_BODY.as_bytes());
+            }
+            let (_, held, _) = self.get(self.member(), SHADOW_TAIL).await;
+            let (_, list, _) = self.get(self.anon(), "/servers").await;
+            (
+                anon,
+                json(&held)["error"].as_str().map(str::to_string),
+                json(&list)["metadata"]["count"].as_i64().unwrap_or(-1),
+            )
+        }
+    }
+
+    /// #5456: bytes B published later at the pinned coordinate in a member
+    /// that outranks the pinned one change what the advertised Virtual URL
+    /// delivers, so the version is held (`mcp_unresolvable`) instead of
+    /// served with a pin and a gate that no longer describe the download.
+    /// Removing B restores it, still pinned to (and delivering) A. Every
+    /// format whose pin is served through `registryBaseUrl`.
+    #[tokio::test]
+    async fn late_virtual_shadowing_holds_the_version_5456() {
+        for case in &SHADOW_CASES {
+            let ty = case.registry_type;
+            let Some(mut env) = Env::new().await else {
+                return;
+            };
+            let f = env.shadow_fixture(case).await;
+            assert_eq!(env.stored_pin().await, (f.a_sha.clone(), vec![f.a]), "{ty}");
+            assert_eq!(env.mcp_view().await, (StatusCode::OK, None, 1), "{ty}");
+            assert_eq!(
+                env.native(case, &f.virt).await,
+                (StatusCode::OK, Some(f.a_sha.clone())),
+                "{ty}: before shadowing the advertised URL delivers the pin"
+            );
+
+            let b = env.seed_package(case, &f.high, b"shadowing bytes B").await;
+            let b_sha = fmt::sha256_hex(b"shadowing bytes B");
+            assert_eq!(
+                env.native(case, &f.virt).await,
+                (StatusCode::OK, Some(b_sha)),
+                "{ty}: the Virtual now serves H (unchanged for non-MCP clients)"
+            );
+            assert_eq!(
+                env.stored_pin().await,
+                (f.a_sha.clone(), vec![f.a]),
+                "{ty}: the pin never moves"
+            );
+            assert_eq!(
+                env.mcp_view().await,
+                (
+                    StatusCode::NOT_FOUND,
+                    Some("mcp_unresolvable".to_string()),
+                    0
+                ),
+                "{ty}: held while the advertised URL delivers other bytes"
+            );
+
+            sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+                .bind(b)
+                .execute(&env.fx.pool)
+                .await
+                .unwrap();
+            assert_eq!(env.mcp_view().await, (StatusCode::OK, None, 1), "{ty}");
+            assert_eq!(
+                env.native(case, &f.virt).await,
+                (StatusCode::OK, Some(f.a_sha.clone())),
+                "{ty}: served again, and the download is A again"
+            );
+            env.teardown().await;
+        }
+    }
+
+    /// #5456 quarantine orders, each in a clean fixture: whatever is
+    /// quarantined, the MCP read and the advertised native download agree
+    /// (the MCP version is never served while the advertised URL delivers,
+    /// or refuses, bytes other than the pinned ones).
+    #[tokio::test]
+    async fn virtual_shadowing_quarantine_orders_agree_5456() {
+        for case in &SHADOW_CASES {
+            let ty = case.registry_type;
+            for order in ["a-unshadowed", "a-then-b", "b"] {
+                let Some(mut env) = Env::new().await else {
+                    return;
+                };
+                let f = env.shadow_fixture(case).await;
+                let b = match order {
+                    "a-unshadowed" => None,
+                    _ => Some(env.seed_package(case, &f.high, b"shadowing bytes B").await),
+                };
+                let target = if order == "b" { b.unwrap() } else { f.a };
+                env.hold(target, Some("quarantined")).await;
+                let (anon, holder, count) = env.mcp_view().await;
+                let (native, delivered) = env.native(case, &f.virt).await;
+                assert_eq!((anon, count), (StatusCode::NOT_FOUND, 0), "{ty} {order}");
+                match order {
+                    // Unshadowed, A quarantined: the gate and the download
+                    // both refuse A.
+                    "a-unshadowed" => {
+                        assert_eq!(holder.as_deref(), Some("mcp_backing_artifact_blocked"));
+                        assert_ne!(native, StatusCode::OK, "{ty} {order}");
+                    }
+                    // Shadowed: the version is held whatever A's state; the
+                    // Virtual serves B to non-MCP clients, never as A.
+                    "a-then-b" => {
+                        assert!(holder.is_some(), "{ty} {order}");
+                        assert_ne!(delivered.as_deref(), Some(f.a_sha.as_str()));
+                    }
+                    // B quarantined: the Virtual refuses the coordinate (it
+                    // does not fall through to A, #3220), and so does MCP.
+                    _ => {
+                        assert_eq!(holder.as_deref(), Some("mcp_unresolvable"), "{ty}");
+                        assert_ne!(native, StatusCode::OK, "{ty} {order}");
+                    }
+                }
+                env.teardown().await;
+            }
+        }
+    }
+
+    /// #5456: a higher-priority Remote member that has the version in its
+    /// proxy cache shadows the pin like a published row does, and a pinned
+    /// member that leaves the Virtual leaves nothing to deliver the pin.
+    #[tokio::test]
+    async fn proxy_cache_shadowing_and_member_removal_hold_the_version_5456() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let case = &SHADOW_CASES[0];
+        let f = env.shadow_fixture_over(case, "remote").await;
+        assert_eq!(env.mcp_view().await, (StatusCode::OK, None, 1));
+        let cache_row: Uuid = sqlx::query_scalar(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+             size_bytes, checksum_sha256) VALUES ($1, $2, 'k', 'm', 1, $3) RETURNING id",
+        )
+        .bind(f.high.id)
+        .bind(case.path)
+        .bind("b".repeat(64))
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            env.mcp_view().await,
+            (
+                StatusCode::NOT_FOUND,
+                Some("mcp_unresolvable".to_string()),
+                0
+            )
+        );
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE id = $1")
+            .bind(cache_row)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(env.mcp_view().await, (StatusCode::OK, None, 1));
+        sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(f.low_id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            env.mcp_view().await,
+            (
+                StatusCode::NOT_FOUND,
+                Some("mcp_unresolvable".to_string()),
+                0
+            )
+        );
+        env.teardown().await;
+    }
 }

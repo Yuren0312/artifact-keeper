@@ -1165,6 +1165,112 @@ async fn gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<GateRow>, sqlx::
     Ok(rows.into_iter().map(gate_row).collect())
 }
 
+/// Whether the Virtual a pin was resolved through no longer delivers the
+/// pinned rows at the advertised URL (#5456).
+///
+/// npm, PyPI, NuGet and Cargo pins are served as `registryBaseUrl` = the
+/// mapped repository, and a Virtual serves a version from the first member,
+/// by priority, that holds it; a member whose download gate refuses the
+/// version it holds refuses the request rather than falling through (#3220).
+/// So once a member that outranks the pinned rows' member holds the same
+/// coordinate (at any quarantine status: published, pulled through, or in
+/// its proxy cache), a client following the approved document downloads, or
+/// is refused, bytes the gate never evaluated. The pinned member leaving the
+/// Virtual is the same. The version is then unresolvable: the gate and the
+/// delivery must select the same row, and the pin is never moved silently.
+/// It serves again when the shadowing row goes; otherwise publish a new
+/// version, which pins what the Virtual serves now.
+///
+/// OCI pins are digest-addressed (`<repo>/<path>@sha256:<digest>`) and MCPB
+/// bundles are served from their own route, so neither is affected.
+async fn virtual_shadowed(
+    db: &PgPool,
+    pin: &PackagePin,
+    rows: &[GateRow],
+) -> Result<bool, McpError> {
+    let r = &pin.resolved;
+    let cached = rows.iter().any(|row| row.cached);
+    if matches!(pin.registry_type.as_str(), "oci" | "mcpb")
+        || (!cached && rows.iter().all(|row| row.repository_id == r.repository_id))
+    {
+        // The rows are the mapped repository's own: not a Virtual.
+        return Ok(false);
+    }
+    let (Some(version), Some(lookup)) = (
+        pin.submitted.version.as_deref(),
+        pin.submitted
+            .version
+            .as_deref()
+            .and_then(|v| lookup_version(&pin.registry_type, v)),
+    ) else {
+        return Ok(false);
+    };
+    // Members in priority order. An artifact pin records the Virtual's id; a
+    // cache pin records its Remote member's id and the Virtual's key.
+    let members: Vec<(Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT m.member_repo_id, r.repo_type::text FROM repositories v \
+         LEFT JOIN virtual_repo_members m ON m.virtual_repo_id = v.id \
+         LEFT JOIN repositories r ON r.id = m.member_repo_id \
+         WHERE v.repo_type = 'virtual' AND (v.id = $1 OR v.key = $2) \
+         ORDER BY m.priority",
+    )
+    .bind(r.repository_id)
+    .bind(&r.repository)
+    .fetch_all(db)
+    .await
+    .map_err(db_err)?;
+    if members.is_empty() {
+        return Ok(false);
+    }
+    let pinned: HashSet<Uuid> = if cached {
+        HashSet::from([r.repository_id])
+    } else {
+        rows.iter().map(|row| row.repository_id).collect()
+    };
+    let Some(at) = members
+        .iter()
+        .position(|(id, _)| id.is_some_and(|id| pinned.contains(&id)))
+    else {
+        return Ok(true);
+    };
+    let above: Vec<Uuid> = members[..at].iter().filter_map(|(id, _)| *id).collect();
+    if above.is_empty() {
+        return Ok(false);
+    }
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM artifacts a \
+         WHERE a.repository_id = ANY($1) AND a.is_deleted = false AND {})",
+        name_predicate(&pin.registry_type)
+    );
+    let held_above: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(&above)
+        .bind(lookup_name(&pin.registry_type, &pin.submitted.identifier))
+        .bind(&lookup)
+        .fetch_one(db)
+        .await
+        .map_err(db_err)?;
+    if held_above {
+        return Ok(true);
+    }
+    for (id, repo_type) in &members[..at] {
+        let (Some(id), Some("remote")) = (id, repo_type.as_deref()) else {
+            continue;
+        };
+        let entry = crate::services::mcp_resolver::cached_entry(
+            db,
+            *id,
+            &pin.registry_type,
+            &pin.submitted.identifier,
+            version,
+        )
+        .await?;
+        if entry.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether the pinned OCI manifest still exists in its repository.
 async fn oci_pin_present(db: &PgPool, pin: &PackagePin) -> Result<bool, sqlx::Error> {
     let r = &pin.resolved;
@@ -1512,6 +1618,11 @@ async fn backing_gate(ctx: GateCtx<'_>, cache: &mut FactsCache, pin: &PackagePin
     if rows.is_empty() {
         return GateOutcome::Unresolvable;
     }
+    match virtual_shadowed(ctx.db, pin, &rows).await {
+        Ok(false) => {}
+        Ok(true) => return GateOutcome::Unresolvable,
+        Err(_) => return GateOutcome::Unavailable,
+    }
     let now = Utc::now();
     for row in &rows {
         if row.cached {
@@ -1671,6 +1782,9 @@ async fn listing_refusals_inner(
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             blocked = found.is_empty() || found.iter().any(|r| backing_refused.contains(&r.id));
+            if !blocked {
+                blocked = virtual_shadowed(db, pin, found).await.map_err(|_| ())?;
+            }
             if !blocked && pin.registry_type == "oci" {
                 blocked = !oci_pin_present(db, pin).await.map_err(|_| ())?;
             }
